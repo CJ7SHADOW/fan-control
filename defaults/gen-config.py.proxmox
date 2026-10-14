@@ -29,6 +29,11 @@ config_object["system_info"] = {
 ## disk_list is the list of disks to monitor. da# is FreeBSD based, sdX is debian based
 #    "disks": ["da0", "da1", "da2", "da3", "da4", "da5", "da6", "da7", "da8", "da9", "da10", "da11", "da12", "da13"],
     "disks": ["sda", "sdb", "sdc", "sdd", "sde", "sdf", "sdg", "sdh", "sdi", "sdj"],
+## cpu_zone / hdd_zone: Supermicro fan zone numbers, only used when single_zone is False.
+##      Most boards: Zone 0 = FAN1-FANn (CPU/system), Zone 1 = FANA-FANx (peripheral/storage).
+##      If your CPU fan is on a lettered header (FANA), swap these: cpu_zone 1, hdd_zone 0.
+    "cpu_zone": 0,
+    "hdd_zone": 1,
 }
 
 ### Fan Curve(s)
@@ -66,6 +71,23 @@ config_object["fan_curve"] = {
 config_object["hdd_panic"] = {
     "max_temp": 50,
     "panic_addition": 5
+}
+
+# Fan speed limits applied after the curves (percent). Raise min_speed if the BMC logs fans
+# going below their lower RPM threshold, which makes it slam every fan to 100%.
+config_object["fan_limits"] = {
+    "min_speed": 20,
+    "max_speed": 100,
+}
+
+# Smoothing to stop the fans hunting up and down on short temperature spikes
+config_object["smoothing"] = {
+## cpu_average_seconds: fan speed follows the average CPU temperature over this many seconds (0 = no averaging)
+    "cpu_average_seconds": 10,
+## ramp_down_delay: speed only drops after the target has stayed lower for this many seconds (rising is immediate)
+    "ramp_down_delay": 15,
+## ramp_down_step: when dropping, lower by at most this many percent per CPU check
+    "ramp_down_step": 5,
 }
 
 # timers, in seconds, for how frequently to check the temperatures and adjust fan speeds if needed

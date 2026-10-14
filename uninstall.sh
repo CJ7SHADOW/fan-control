@@ -2,7 +2,7 @@
 
 # So all loops can run with sudo the script itself should be run as sudo.
 # If not, potentially long write times could leave disks at idle for long stretches while waiting for sudo password.
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
         echo "Please run as root"
         exit
 fi
