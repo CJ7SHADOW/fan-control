@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Script should be run as sudo as we're writing to /root
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
         echo "Please run as root"
         exit
 fi

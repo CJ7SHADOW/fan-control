@@ -22,6 +22,10 @@ NOTE: Both of these are generational, and it's very possible that if you have a 
 
 The script supports acting as a single fan zone or multiple zones. This variable is boolean, so set it to `True` or `False`. This is mostly a conceit for SuperMicro systems so users on Dell platforms will want to set this to True. Many SuperMicro motherboards work with numbered fan's (FAN1, FAN2, etc.) and lettered fans (FANA, FANB, etc.). These act as separate zones. The idea is numbered fans generally are the "system" (aka CPU and motherboard cooling) and lettered fans are peripherals (aka hard drives or GPUs). If you'd like to use the zones you can do by setting this variable to False.
 
+### Zone numbers - cpu_zone / hdd_zone
+
+Only used on Supermicro boards with `single_zone` set to False. Most Supermicro boards put the numbered fan headers (FAN1, FAN2, ...) in Zone 0 and the lettered headers (FANA, FANB, ...) in Zone 1, which matches the defaults `cpu_zone = 0` and `hdd_zone = 1`. Some boards and chassis are wired the other way, for example a CPU fan on FANA with the case/drive fans on FAN1-FAN5. In that case set `cpu_zone = 1` and `hdd_zone = 0`. Check which headers your fans use in the IPMI web interface (Sensor Readings) or with `ipmitool sensor | grep -i fan`.
+
 ### Temperature Focus - temp_focus
 
 This setting allows you to tell the script to only care about the CPU temperature if you'd prefer. The available options are `"CPU"` or `"Both"`.
@@ -36,7 +40,7 @@ This is a python list of the disks you want the script to be working against. As
 
 I recommend using your OS's web interfaces to identify the disk names. As on both OS's these are found in /dev that is hard coded in the script so you only need to include the name. Beyond this, when making the list the only real "rules" are ensuring that each has quotes and there are commas between each except the last which should have no trailing comma.
 
-Right now the script only supports drives that should show a temperature via the SMART value 194. If your disks don't have a temperature listed for value 194 don't list them here.
+The script reads temperatures with `smartctl -n standby`, so SATA (attribute 194/190), SAS and NVMe drives all work, and drives that are spun down are skipped instead of being woken up. A drive that can't be read (pulled, failed, renamed) is logged and skipped; the rest keep being monitored.
 
 ## Fan Curves
 
@@ -66,9 +70,21 @@ Due to how the script reads the fan curve, you can add or remove as many entries
 
 Ultimately, this is very user/environment dependent area of the configuration. The best suggestion is ball park what you think you want, then keep adjusting it until you're happy.
 
+## Fan Limits - fan_limits
+
+`min_speed` and `max_speed` are applied after the fan curves, so no curve can push the fans outside this range. Supermicro BMCs treat a fan spinning below its lower RPM threshold as failed and ramp every fan to 100%, which sounds like the fans "warbling" or spinning up for no reason. If you hear that, raise `min_speed` (or lower the fan's thresholds with `ipmitool sensor thresh`).
+
+## Smoothing - smoothing
+
+These settings stop the fans hunting up and down when CPU temperature spikes for a few seconds, which is common on loud server CPU coolers.
+
+- `cpu_average_seconds`: the CPU curve uses the average temperature over this many seconds instead of the instant reading. A 3 second spike gets diluted instead of sending the fan to full speed. Set to 0 to disable.
+- `ramp_down_delay`: fan speed rises immediately, but only drops after the target speed has stayed lower for this many seconds.
+- `ramp_down_step`: once it does drop, speed falls by at most this many percent per CPU check, so the fan winds down gradually instead of dropping in one step.
+
 ## Maximum Temperatures - hdd_panic
 
-This section of the configuration allows you set a maximum drive temperature to react to. In a large pool of disks, it's common for one or more disks to run at higher temperatures than others. Setting the `max_temp` sets a target temperature you want the drives to stay below, and the `panic_addition` is a "bonus" fan speed. If any one drive breeches the `max_temp` the script will figure out the appropriate speed from the curve then add the `panic_addition` to it. This allows the script to provide more cooling to help get the drive temperatures down further.
+This section of the configuration allows you set a maximum drive temperature to react to. In a large pool of disks, it's common for one or more disks to run at higher temperatures than others. Setting the `max_temp` sets a target temperature you want the drives to stay below, and the `panic_addition` is a "bonus" fan speed. If any one drive reaches the `max_temp` the script looks up that drive's temperature on the HDD curve, then adds the `panic_addition` to it. The log names the drive that triggered it. This allows the script to provide more cooling to help get the drive temperatures down further.
 
 The `max_temp` value is somewhat more objective than other values you can set in this script, however it will be dependent on your drives. For all of my systems, I'm using drives where 50C is well within the safe operating temperatures, although it is somewhat high. Historically I know the general suggestion is 40C for spinning disks, but in the last decade there's been a lot of development in the hardware and while not ideal to run up to 50C many drives can handle it without significant issue. Similar can be said for SSDs. For my setup I use 50C as a `max_temp` because my hardware allows for it, and since my server rack is so close to my desk and I hear it all the time it's just uncomfortable to have a max temp much lower due to how frequently panic triggers. You can change it to reflect your own environment/comfort level.
 
@@ -78,7 +94,7 @@ It's also worth noting, you can easily adjust your fan curve to account for the 
 
 This section of the configuration allows you to set how frequently the script should check the CPU and the storage temperatures. Generally speaking I suggest leaving these as is. CPU temperatures can fluctuate greatly and rapidly so setting the CPU timer higher than 5 is ill advised, and I think many users would prefer leaving it at 1 for quick fan speed adjustments when the system is under load. For storage, specifically with spinning disks, just due to the mass of metal they tend to take on heat slower than CPUs and also cooler slower.
 
-In the context of this script, these "timers" don't really work against actual time. Instead they work via python's `sleep` function and iterating a counter to check if they need to run again. I plan on reworking this so it works against actual time at some point.
+The timers are scheduled against the system clock, so a slow round of `smartctl` reads doesn't stretch the interval.
 
 ## Logging configuration - log_config
 

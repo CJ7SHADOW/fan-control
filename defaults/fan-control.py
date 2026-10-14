@@ -1,363 +1,614 @@
 #!/usr/bin/python3
 ##
-## ipmi-fan-control.py
+## fan-control.py
+##
+## Drives IPMI fan zones from CPU (and optionally HDD) temperatures using fan curves.
+## Supports TrueNAS CORE / pfSense (FreeBSD) and Proxmox (Debian) on Supermicro X10
+## and Dell iDRAC 8 boards. Settings live in config.ini next to this script and are
+## re-read automatically whenever the file changes.
+##
+## Written to run on Python 3.6+ (TrueNAS CORE ships 3.9).
+
+import ast
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+from configparser import ConfigParser
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.ini")
+
+# rc.d / init tasks can start us with a minimal PATH; make sure ipmitool, smartctl,
+# sysctl and sensors can be found on every supported OS.
+os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+REFRESH_SECONDS = 60       # re-send the current speed this often even if unchanged, in case the BMC reset it
+ERROR_REPEAT_SECONDS = 300  # identical errors are logged at most once per this many seconds
+
+VALID_OS = ("TrueNAS", "pfSense", "Proxmox")
+VALID_PLATFORMS = ("SM_X10", "iDRAC_Gen08")
+VALID_FOCUS = ("CPU", "Both")
+VALID_FREQUENCY = ("Every", "On_Change", "On_Panic")
+
+log = logging.getLogger("fan-control")
+
+
+class ConfigError(Exception):
+    pass
+
+
+##
+## Configuration
 ##
 
-# import needed components
-import time # used for sleep
-import subprocess # used to execute external commands
-import logging # lets make some nice logs
-import json # we'll use json to handle reading the data from sensors a bit more cleanly/easily in Proxmox
-import os # used to check if config.ini has changed
-from configparser import ConfigParser # using ConfigParser for separate config file
-import ast # used when importing config.ini to make it cleaner to work with
+def config_mtime():
+    return os.stat(CONFIG_PATH).st_mtime
 
-## need to load some config info at the top
-# Read config.ini file
-config_object = ConfigParser()
-config_object.read("config.ini")
-# logging
-log_file_name = config_object["log_config"]["file_name"]
-log_format = config_object["log_config"]["format"]
-log_date_format = config_object["log_config"]["date_format"]
-log_frequency = config_object["log_config"]["frequency"]
-# ipmi type
-hardware_platform = config_object["system_info"]["ipmi_type"]
-# HDD temp cycle
-detect_hdd_temp_every = int(config_object["detect_timers"]["hdd_timer"])
 
-## define log basics
-logging.basicConfig(format=log_format, datefmt=log_date_format, filename=log_file_name, level=logging.DEBUG)
+def parse_curve(text, name):
+    try:
+        curve = ast.literal_eval(text)
+        points = sorted((float(t), float(s)) for t, s in curve)
+    except (ValueError, SyntaxError, TypeError) as exc:
+        raise ConfigError("fan_curve '{}' is not a list of [temp, speed] pairs: {}".format(name, exc))
+    if len(points) < 2:
+        raise ConfigError("fan_curve '{}' needs at least two points".format(name))
+    return points
 
-## lets make some logic
 
-def logger_start(): # show when logging of fan-control sessions starts
-    logging.info("=============================")
-    logging.info("||                         ||")
-    logging.info("||  FAN CONTROL HAS BEGUN  ||")
-    logging.info("||                         ||")
-    logging.info("|| assuming direct control ||") # couldn't stop myself from a Mass Effect 2 joke for some reason
-    logging.info("||                         ||")
-    logging.info("=============================")
+def load_config():
+    parser = ConfigParser()
+    if not parser.read(CONFIG_PATH):
+        raise ConfigError("cannot read {}".format(CONFIG_PATH))
+    try:
+        si = parser["system_info"]
+        cfg = {
+            "os": si["system_os"],
+            "platform": si["ipmi_type"],
+            "linked": si.getboolean("single_zone"),
+            "focus": si["temp_focus"],
+            "disks": list(ast.literal_eval(si["disks"])),
+            # Supermicro zone numbers. Most boards: Zone 0 = FAN1-n (CPU/system), Zone 1 = FANA-x (peripheral).
+            # Swap these if your board/chassis is wired the other way round.
+            "cpu_zone": si.getint("cpu_zone", fallback=0),
+            "hdd_zone": si.getint("hdd_zone", fallback=1),
+            "cpu_curve": parse_curve(parser["fan_curve"]["cpu"], "cpu"),
+            "hdd_curve": parse_curve(parser["fan_curve"]["hdd"], "hdd"),
+            "min_speed": parser.getint("fan_limits", "min_speed", fallback=0),
+            "max_speed": parser.getint("fan_limits", "max_speed", fallback=100),
+            "hdd_max_temp": parser.getfloat("hdd_panic", "max_temp"),
+            "panic_addition": parser.getint("hdd_panic", "panic_addition"),
+            "cpu_timer": parser.getfloat("detect_timers", "cpu_timer"),
+            "hdd_timer": parser.getfloat("detect_timers", "hdd_timer"),
+            "cpu_average_seconds": parser.getfloat("smoothing", "cpu_average_seconds", fallback=10),
+            "ramp_down_delay": parser.getfloat("smoothing", "ramp_down_delay", fallback=15),
+            "ramp_down_step": parser.getint("smoothing", "ramp_down_step", fallback=5),
+            "log_frequency": parser["log_config"]["frequency"],
+        }
+    except KeyError as exc:
+        raise ConfigError("missing setting {} in {}".format(exc, CONFIG_PATH))
+    except (ValueError, SyntaxError) as exc:
+        raise ConfigError("bad value in {}: {}".format(CONFIG_PATH, exc))
 
-def has_config_changed(): # used to check if the config file has changed so values can be updated
-    stat = os.stat("config.ini")
-    return stat.st_mtime
+    if cfg["os"] not in VALID_OS:
+        raise ConfigError("system_os must be one of {}".format(", ".join(VALID_OS)))
+    if cfg["platform"] not in VALID_PLATFORMS:
+        raise ConfigError("ipmi_type must be one of {}".format(", ".join(VALID_PLATFORMS)))
+    if cfg["focus"] not in VALID_FOCUS:
+        raise ConfigError("temp_focus must be one of {}".format(", ".join(VALID_FOCUS)))
+    if cfg["log_frequency"] not in VALID_FREQUENCY:
+        raise ConfigError("frequency must be one of {}".format(", ".join(VALID_FREQUENCY)))
+    if not 0 <= cfg["min_speed"] <= cfg["max_speed"] <= 100:
+        raise ConfigError("fan_limits must satisfy 0 <= min_speed <= max_speed <= 100")
+    if cfg["cpu_timer"] <= 0 or cfg["hdd_timer"] <= 0:
+        raise ConfigError("detect_timers must be greater than 0")
+    for key in ("cpu_zone", "hdd_zone"):
+        if not 0 <= cfg[key] <= 255:
+            raise ConfigError("{} must be a zone number between 0 and 255".format(key))
+    if cfg["ramp_down_step"] < 1:
+        raise ConfigError("ramp_down_step must be at least 1")
+    if cfg["platform"] == "iDRAC_Gen08" and not cfg["linked"]:
+        log.warning("Config: iDRAC only supports a single fan zone; treating single_zone as True")
+        cfg["linked"] = True
+    if not cfg["linked"] and cfg["cpu_zone"] == cfg["hdd_zone"]:
+        raise ConfigError("cpu_zone and hdd_zone are the same zone; set single_zone = True instead")
+    return cfg
+
+
+def describe_config(cfg):
+    lines = [
+        "Config loaded from {}".format(CONFIG_PATH),
+        "  System OS: {os}   Platform: {platform}   Linked zones: {linked}   Focus: {focus}".format(**cfg),
+    ]
+    if not cfg["linked"]:
+        lines.append("  CPU zone: {cpu_zone}   HDD zone: {hdd_zone}".format(**cfg))
+    lines += [
+        "  Drives: {}".format(", ".join(cfg["disks"]) if cfg["focus"] == "Both" else "(not monitored, focus is CPU)"),
+        "  CPU curve: {}".format(format_curve(cfg["cpu_curve"])),
+        "  HDD curve: {}".format(format_curve(cfg["hdd_curve"])),
+        "  Fan limits: {min_speed}-{max_speed}%   HDD panic: {hdd_max_temp:g}C (+{panic_addition}%)".format(**cfg),
+        "  Timers: CPU every {cpu_timer:g}s, HDD every {hdd_timer:g}s".format(**cfg),
+        "  Smoothing: CPU temp averaged over {cpu_average_seconds:g}s, ramp down after {ramp_down_delay:g}s"
+        " in steps of {ramp_down_step}%".format(**cfg),
+        "  Log frequency: {log_frequency}".format(**cfg),
+    ]
+    return "\n".join(lines)
+
+
+def format_curve(curve):
+    return " ".join("{:g}C={:g}%".format(t, s) for t, s in curve)
+
+
+##
+## Temperature sources
+##
+
+def run(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+
+def run_checked(cmd):
+    result = run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError("{} failed (exit {}): {}".format(
+            " ".join(cmd), result.returncode, (result.stderr or result.stdout).strip()[:300]))
+    return result.stdout
+
 
 def get_cpu_temp(op_sys):
+    """Average temperature across all CPU cores, in C."""
+    temps = []
     if op_sys == "Proxmox":
-        sensors_data_json = json.loads(subprocess.check_output('sensors -j', shell=True)) # gets json formatted temperatures from sensors command, loads them into a variable as a dictionary
-        temps_list = [] # define list for temperatures to be added to with following iterations
-        for sensors_data_name, sensors_data_value in sensors_data_json.items(): # iterate thru every data set dict in json output
-            if "coretemp" in sensors_data_name: # find dicts with coretemp data
-                for coretemp_data_name, coretemp_data_value in sensors_data_value.items(): # iterate thru core temp data sets
-                    if "Core " in coretemp_data_name: # find dicts with actual core data
-                        for temps_data_name, temps_data_value in coretemp_data_value.items(): #iterate thru core data set
-                            if "input" in temps_data_name: # find data with actual temperature value
-                                temps_list.append(temps_data_value) # add that data to the full list
-        cpu_avg_temp = sum(temps_list) / len(temps_list) # run a quick average of the data
-        return round(cpu_avg_temp,2)
-    if op_sys == "TrueNAS" or "pfSense":
-        cpu_temps_cmd = "sysctl -a dev.cpu |  grep temperature | awk '{print $2}' | sed 's/.$//'" # define command to find the CPU temps by core
-        cpu_temps = subprocess.check_output(cpu_temps_cmd, shell=True) # get the CPU temps into variable cpu_temps
-        cpu_temps_list = list(map(float, cpu_temps.splitlines())) # take cpu_temps and create list for iterating on
-        cpu_avg_temp = sum(cpu_temps_list) / len(cpu_temps_list) # run a quick average of the data
-        return round(cpu_avg_temp,2)
-
-def get_hdd_temp(disk_list): # this feels like a silly way to do it but it works I guess
-    # create output list for smartctl run(s) and hdd_temps list, then get the HDD temps into list
-    smartctl_output = []
-
-    for disk_dev in disk_list: # iterate thru the list of drives to monitor
-        hdd_temps_cmd = "smartctl -A /dev/" + disk_dev + " | grep '^194 Temp' | awk '{print $10}'" # define command to find the HDD temps by device
-        smartctl_output.append(int(subprocess.check_output(hdd_temps_cmd, shell=True))) # run the command, dump to raw output list
-
-    hdd_avg_temp = sum(smartctl_output) / len(smartctl_output) # run a quick average of the data
-    hdd_max_temp = max(smartctl_output) # find the highest temp disk
-    return [round(hdd_avg_temp,2), hdd_max_temp]
-
-def get_cpu_zone_speed(temp,cpu_fan_curve): # based on the fan curve, decide what the appropriate fan power level (fan speed) should be, return it as an integer.
-    i = 0 # create an iterator
-    power = 100  # Set as backup, (usually) overwritten below
-    while i < (len(cpu_fan_curve) - 1): # while iterator is 1 less than total length of fan curve...
-        a = cpu_fan_curve[i] # set 'a' to curve temp value of iterator
-        b = cpu_fan_curve[i + 1] # set 'b' to next curve temp value of iterator
-
-        if temp > a[0] and temp <= b[0]: # if current average temperature is greater or equal to 'a' and less or equal to 'b' ...
-            power = a[1] + (temp - a[0]) * (b[1] - a[1]) / (b[0] - a[0]) # do some math to figure out what to set fan power to
-            break
-        i += 1 # bump the iterator
-    return int(power)
-
-def get_hdd_zone_speed(temps,max_temp,speed_addition,hdd_fan_curve): # based on the fan curve, decide what the appropriate fan power level (fan speed) should be, return it as an integer.
-    i = 0 # create an iterator
-    power = 100  # Set as backup, (usually) overwritten below
-    if temps[1] >= max_temp: # if current max temp is greater than config's max temp bump the returned power by our max addition
-        a = hdd_fan_curve[i] # set 'a' to curve temp value of iterator
-        b = hdd_fan_curve[i + 1] # set 'b' to next curve temp value of iterator
-
-        power = a[1] + (max_temp - a[0]) * (b[1] - a[1]) / (b[0] - a[0]) # do some math to figure out what to set fan power to
-        return int(power) + speed_addition
-    else: # if not, return base power we just figured out
-        while i < (len(hdd_fan_curve) - 1): # while iterator is 1 less than total length of fan curve...
-            a = hdd_fan_curve[i] # set 'a' to curve temp value of iterator
-            b = hdd_fan_curve[i + 1] # set 'b' to next curve temp value of iterator
-
-            if temps[0] > a[0] and temps[0] <= b[0]: # if current average temperature is greater or equal to 'a' and less or equal to 'b' ...
-                power = a[1] + (temps[0] - a[0]) * (b[1] - a[1]) / (b[0] - a[0]) # do some math to figure out what to set fan power to
-                break
-            i += 1 # bump the iterator
-        return int(power)
-
-def set_cpu_zone_fan_speed(zone_0_speed): # simple method to set the Zone 0 fan speed
-    cmd = 'ipmitool raw 0x30 0x70 0x66 0x01 0x00 {speed}'.format(speed=zone_0_speed)
-    subprocess.check_output(cmd, shell=True)
-
-def set_hdd_zone_fan_speed(zone_1_speed): # simple method to set the Zone 1 fan speed
-    cmd = 'ipmitool raw 0x30 0x70 0x66 0x01 0x01 {speed}'.format(speed=zone_1_speed)
-    subprocess.check_output(cmd, shell=True)
-
-def set_linked_zone_fan_speed(platform,speed): # simple method to set fan speed for both zones
-    if platform == "SM_X10":
-        cmd = 'ipmitool raw 0x30 0x70 0x66 0x01 0x00 {speed}'.format(speed=speed)
-        subprocess.check_output(cmd, shell=True)
-        cmd = 'ipmitool raw 0x30 0x70 0x66 0x01 0x01 {speed}'.format(speed=speed)
-        subprocess.check_output(cmd, shell=True)
-    if platform == "iDRAC_Gen08":
-        hex_power = hex(speed) # convert incoming variable to hex
-        cmd = 'ipmitool raw 0x30 0x30 0x02 0xff {hex_power}'.format(hex_power=hex_power)
-        subprocess.check_output(cmd, shell=True)
+        data = json.loads(run_checked(["sensors", "-j"]))
+        for chip, chip_data in data.items():
+            if not isinstance(chip_data, dict):
+                continue
+            if chip.startswith("coretemp"):       # Intel: one entry per core
+                wanted = [k for k in chip_data if k.startswith("Core ")]
+            elif chip.startswith("k10temp"):      # AMD: per-CCD if present, otherwise Tctl
+                wanted = [k for k in chip_data if k.startswith("Tccd")] or [k for k in chip_data if k in ("Tdie", "Tctl")][:1]
+            else:
+                continue
+            for label in wanted:
+                for key, value in chip_data[label].items():
+                    if key.endswith("_input"):
+                        temps.append(float(value))
+    elif op_sys in ("TrueNAS", "pfSense"):
+        output = run_checked(["sysctl", "-a", "dev.cpu"])
+        temps = [float(t) for t in re.findall(r"^dev\.cpu\.\d+\.temperature:\s*(-?[\d.]+)C", output, re.M)]
+    if not temps:
+        raise RuntimeError("no CPU temperature readings found (FreeBSD: is the coretemp/amdtemp module loaded? "
+                           "Linux: is lm-sensors installed?)")
+    return sum(temps) / len(temps)
 
 
-##
-## OK, lets do all the things.
-##
+_smartctl_json = None  # None = not tested yet
 
-logger_start()
 
-config_loaded = False # assume config not loaded at first
-config_last_changed = has_config_changed() # go ahead and get the current change time
-hdd_itter = detect_hdd_temp_every # create an HDD iterator we'll use for a timer
-# defaults fan speeds to 100%, and creates variables so things will hold during loop skips
-current_cpu_fan_speed = 100
-current_hdd_fan_speed = 100
-hdd_suggested_fan_speed = 0
-last_cpu_fan_speed = 0
-last_hdd_fan_speed = 0
+def read_disk_temp(dev):
+    """Return (temperature or None, state) where state is 'ok', 'standby' or an error message.
 
-## if Supermicro, set fans to full so they don't "warble" and hold at our most recent request
-if hardware_platform == "SM_X10":
-    cmd = 'ipmitool raw 0x30 0x45 0x01 0x01'
-    subprocess.check_output(cmd, shell=True)
-    time.sleep(2)
+    Uses -n standby so sleeping drives are skipped rather than spun up.
+    """
+    global _smartctl_json
+    path = dev if dev.startswith("/dev/") else "/dev/" + dev
 
-## if Dell, set fans to allow full manual control to stop iDRAC from trying to manage it
-if hardware_platform == "iDRAC_Gen08":
-   cmd = 'ipmitool raw 0x30 0x30 0x01 0x00'
-   subprocess.check_output(cmd, shell=True)
-   time.sleep(2)
-
-while True: # This is a service so it needs to run forever... so... lets make an infinite loop!
-    try:
-        if config_loaded is False or config_last_changed != has_config_changed(): # on every loop, check to see if the config file has changed, if so reload it
-            ## Read config.ini file
-            config_object = ConfigParser()
-            config_object.read("config.ini")
-            ## system info
-            operating_system = config_object["system_info"]["system_os"]
-            hardware_platform = config_object["system_info"]["ipmi_type"]
-            fan_control_linked = config_object["system_info"].getboolean("single_zone")
-            control_focus = config_object["system_info"]["temp_focus"]
-            hdd_to_monitor = ast.literal_eval(config_object["system_info"]["disks"])
-            ## fan curve
-            cpu_fan_curve = ast.literal_eval(config_object["fan_curve"]["cpu"])
-            hdd_fan_curve = ast.literal_eval(config_object["fan_curve"]["hdd"])
-            ## temperature related data
-            hdd_max_temp = int(config_object["hdd_panic"]["max_temp"])
-            hdd_max_temp_addition = int(config_object["hdd_panic"]["panic_addition"])
-            ## timers
-            detect_cpu_temp_every = int(config_object["detect_timers"]["cpu_timer"])
-            detect_hdd_temp_every = int(config_object["detect_timers"]["hdd_timer"])
-            ## logging
-            log_file_name = config_object["log_config"]["file_name"]
-            log_format = config_object["log_config"]["format"]
-            log_date_format = config_object["log_config"]["date_format"]
-            log_frequency = config_object["log_config"]["frequency"]
-            ## confirm complete
-            config_loaded = True
-            config_last_changed = has_config_changed()
-            logging.info("""
-
-            Config: Config loaded! Current config is:
-            System OS: {os}
-            Hardware Platform: {plat}
-            Linked Fan Zones: {link}
-            Drives to Monitor: {drives}
-            CPU Fan Curve: {cpu_curve}
-            HDD Fan Curve: {hdd_curve}
-            HDD Panic Temp: {hmax}
-            HDD Panic Addition: {addition}
-            Log Frequency: {freq}
-
-            """.format(os=operating_system,plat=hardware_platform,link=fan_control_linked,drives=hdd_to_monitor,cpu_curve=cpu_fan_curve,hdd_curve=hdd_fan_curve,hmax=hdd_max_temp,addition=hdd_max_temp_addition,freq=log_frequency))
-
-        if control_focus == "CPU":
-            if fan_control_linked is True:
-                current_cpu_temp = get_cpu_temp(operating_system) #get current CPU average temp
-                current_cpu_fan_speed = get_cpu_zone_speed(current_cpu_temp,cpu_fan_curve) # get what the fan speed should be based on above temp
-                if log_frequency == "Every":
-                    logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                    set_linked_zone_fan_speed(hardware_platform, current_cpu_fan_speed) # set the fan speed
-                if log_frequency == "On_Change":
-                    if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                        last_cpu_fan_speed = current_cpu_fan_speed
-                        logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                        set_linked_zone_fan_speed(hardware_platform, current_cpu_fan_speed) # set the fan speed
-                if log_frequency == "On_Panic":
-                    set_linked_zone_fan_speed(hardware_platform, current_cpu_fan_speed) # set the fan speed
-            else: # if Fan Zones are not linked
-                current_cpu_temp = get_cpu_temp(operating_system) #get current CPU average temp
-                current_cpu_fan_speed = get_cpu_zone_speed(current_cpu_temp,cpu_fan_curve) # get what the fan speed should be based on above temp
-                if log_frequency == "Every":
-                    logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                    set_cpu_zone_fan_speed(current_cpu_fan_speed) # set the fan speed
-                if log_frequency == "On_Change":
-                    if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                        last_cpu_fan_speed = current_cpu_fan_speed
-                        logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                        set_cpu_zone_fan_speed(current_cpu_fan_speed) # set the fan speed
-                if log_frequency == "On_Panic":
-                    set_cpu_zone_fan_speed(current_cpu_fan_speed) # set the fan speed
-        if control_focus == "Both":
-            if fan_control_linked is True:
-                current_cpu_temp = get_cpu_temp(operating_system) #get current average temp
-                current_cpu_fan_speed = get_cpu_zone_speed(current_cpu_temp,cpu_fan_curve) # get what the fan speed should be based on above temp
-                hdd_itter += detect_cpu_temp_every # bump the hdd timer
-                if hdd_itter >= detect_hdd_temp_every: # check if we need to run our HDD checks
-                    current_hdd_temp = get_hdd_temp(hdd_to_monitor) # get current HDD average and max temps
-                    current_hdd_fan_speed = get_hdd_zone_speed(current_hdd_temp,hdd_max_temp,hdd_max_temp_addition,hdd_fan_curve) # get what the fan speed should be based on above temp
-                    if current_cpu_fan_speed > current_hdd_fan_speed:
-                        if log_frequency == "Every":
-                            logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed))
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_cpu_fan_speed))
-                            set_linked_zone_fan_speed(hardware_platform,current_cpu_fan_speed) # set the fan speed
-                        if log_frequency == "On_Change":
-                            if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                                last_cpu_fan_speed = current_cpu_fan_speed
-                                logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed))
-                                logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_cpu_fan_speed))
-                                set_linked_zone_fan_speed(hardware_platform,current_cpu_fan_speed) # set the fan speed
-                        if log_frequency == "On_Panic":
-                            if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                                last_cpu_fan_speed = current_cpu_fan_speed
-                                set_linked_zone_fan_speed(hardware_platform,current_cpu_fan_speed) # set the fan speed
-                    if current_hdd_fan_speed >= current_cpu_fan_speed:
-                        if log_frequency == "Every":
-                            logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed))
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                            set_linked_zone_fan_speed(hardware_platform,current_hdd_fan_speed) # set the fan speed
-                        if log_frequency == "On_Change":
-                            if current_hdd_fan_speed > last_hdd_fan_speed or current_hdd_fan_speed < last_hdd_fan_speed:
-                                last_hdd_fan_speed = current_hdd_fan_speed
-                                logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed))
-                                logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                                set_linked_zone_fan_speed(hardware_platform,current_hdd_fan_speed) # set the fan speed
-                        if log_frequency == "On_Panic":
-                            if current_hdd_fan_speed > last_hdd_fan_speed or current_hdd_fan_speed < last_hdd_fan_speed:
-                                last_hdd_fan_speed = current_hdd_fan_speed
-                                set_linked_zone_fan_speed(hardware_platform,current_hdd_fan_speed) # set the fan speed
-                    if current_hdd_temp[1] >= hdd_max_temp:
-                        if log_frequency == "Every" or log_frequency == "On_Change":
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                            logging.warning("HDD Temp: Max HDD temperature met or exceeded! Holding fans for {time} seconds at {fan_speed}%".format(time=detect_hdd_temp_every*2,fan_speed=current_hdd_fan_speed)) # drop a warning to log if HDD temp hits max
-                            time.sleep(detect_hdd_temp_every) # lets sleep for a bit to give the HDDs time to chill
-                        if log_frequency == "On_Panic":
-                            logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed))
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                            logging.warning("HDD Temp: Max HDD temperature met or exceeded! Holding fans for {time} seconds at {fan_speed}%".format(time=detect_hdd_temp_every*2,fan_speed=current_hdd_fan_speed)) # drop a warning to log if HDD temp hits max
-                            time.sleep(detect_hdd_temp_every) # lets sleep for a bit to give the HDDs time to chill
-                    hdd_itter = 0 # reset our HDD timer
-                    hdd_suggested_fan_speed = current_hdd_fan_speed # set a variable to hold the fan speed for future loops
-                else: # now just checking CPU
-                    if hdd_suggested_fan_speed >= current_cpu_fan_speed: # check if our last HDD temps were higher and act accordingly
-                        if log_frequency == "Every":
-                            logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=hdd_suggested_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                            set_linked_zone_fan_speed(hardware_platform,hdd_suggested_fan_speed) # set the fan speed
-                    else: # adjusting based on CPU temps only now
-                        if log_frequency == "Every":
-                            logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                            set_linked_zone_fan_speed(hardware_platform,current_cpu_fan_speed) # set the fan speed
-                        if log_frequency == "On_Change":
-                            if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                                last_cpu_fan_speed = current_cpu_fan_speed
-                                logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                                set_linked_zone_fan_speed(hardware_platform,current_cpu_fan_speed) # set the fan speed
-                        if log_frequency == "On_Panic":
-                            if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                                last_cpu_fan_speed = current_cpu_fan_speed
-                                set_linked_zone_fan_speed(hardware_platform,current_cpu_fan_speed) # set the fan speed
-            else: # if Fan Zones are not linked
-                current_cpu_temp = get_cpu_temp(operating_system) #get current CPU average temp
-                current_cpu_fan_speed = get_cpu_zone_speed(current_cpu_temp,cpu_fan_curve) # get what the fan speed should be based on above temp
-                if log_frequency == "Every":
-                    logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                    set_cpu_zone_fan_speed(current_cpu_fan_speed) # set the fan speed
-                if log_frequency == "On_Change":
-                    if current_cpu_fan_speed > last_cpu_fan_speed or current_cpu_fan_speed < last_cpu_fan_speed:
-                        last_cpu_fan_speed = current_cpu_fan_speed
-                        logging.info("CPU Temp: {temp}C -> Fans: {fan_speed}".format(temp=current_cpu_temp,fan_speed=current_cpu_fan_speed)) # For each loop, write the temp then the proposed fan speed
-                        set_cpu_zone_fan_speed(current_cpu_fan_speed) # set the fan speed
-                if log_frequency == "On_Panic":
-                    set_cpu_zone_fan_speed(current_cpu_fan_speed) # set the fan speed
-
-                hdd_itter += detect_cpu_temp_every # bump the hdd timer
-                if hdd_itter >= detect_hdd_temp_every: # check if we need to run our HDD checks
-                    current_hdd_temp = get_hdd_temp(hdd_to_monitor) #get current HDD average and max temps
-                    current_hdd_fan_speed = get_hdd_zone_speed(current_hdd_temp,hdd_max_temp,hdd_max_temp_addition,hdd_fan_curve) # get what the fan speed should be based on above temp
-                    if log_frequency == "Every":
-                        logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                        set_hdd_zone_fan_speed(current_hdd_fan_speed) # set the fan speed
-                    if log_frequency == "On_Change":
-                        if current_hdd_fan_speed > last_hdd_fan_speed or current_hdd_fan_speed < last_hdd_fan_speed:
-                            last_hdd_fan_speed = current_hdd_fan_speed
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                            set_hdd_zone_fan_speed(current_hdd_fan_speed) # set the fan speed
-                    if log_frequency == "On_Panic":
-                        if current_hdd_fan_speed > last_hdd_fan_speed or current_hdd_fan_speed < last_hdd_fan_speed:
-                            last_hdd_fan_speed = current_hdd_fan_speed
-                            set_hdd_zone_fan_speed(current_hdd_fan_speed) # set the fan speed
-                    if current_hdd_temp[1] >= hdd_max_temp:
-                        if log_frequency == "Every" or log_frequency == "On_Change":
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                            logging.warning("HDD Temp: Max HDD temperature met or exceeded! Holding fans for {time} seconds at {fan_speed}%".format(time=detect_hdd_temp_every*2,fan_speed=current_hdd_fan_speed)) # drop a warning to log if HDD temp hits max
-                            time.sleep(detect_hdd_temp_every) # lets sleep for a bit to give the HDDs time to chill
-                        if log_frequency == "On_Panic":
-                            logging.info("HDD Temp: Average = {avg_temp}C, Max = {max_temp}C-> Fans: {fan_speed}".format(avg_temp=current_hdd_temp[0],max_temp=current_hdd_temp[1],fan_speed=current_hdd_fan_speed))
-                            logging.warning("HDD Temp: Max HDD temperature met or exceeded! Holding fans for {time} seconds at {fan_speed}%".format(time=detect_hdd_temp_every*2,fan_speed=current_hdd_fan_speed)) # drop a warning to log if HDD temp hits max
-                            time.sleep(detect_hdd_temp_every) # lets sleep for a bit to give the HDDs time to chill
-                    hdd_itter = 0 # reset our HDD timer
-
-    except Exception as exc:  # in event of a script crash, dump more data to log
-        logging.error("Critical error occurred!!", exc_info=True)
-
-        logging.info("Setting fans to full speed.")
-        # Set full speed
-        ## if Supermicro, set fans to full so they don't "warble" and hold at our most recent request
-        if hardware_platform == "SM_X10":
-            cmd = 'ipmitool raw 0x30 0x45 0x01 0x01'
-            subprocess.check_output(cmd, shell=True)
-            time.sleep(2)
-
-        ## if Dell, set fans to allow full manual control to stop iDRAC from trying to manage it
-        if hardware_platform == "iDRAC_Gen08":
-            cmd = 'ipmitool raw 0x30 0x30 0x01 0x00'
-            subprocess.check_output(cmd, shell=True)
-            time.sleep(2)
-    finally:
-        # Regardless of what was done above, sleep for same time
+    if _smartctl_json is not False:
+        result = run(["smartctl", "-n", "standby", "-A", "-j", path])
+        if "standby" in (result.stdout + result.stderr).lower() and result.returncode & 2:
+            return None, "standby"
         try:
-            logging.info(f"Sleep timer: {detect_cpu_temp_every}")
-            time.sleep(detect_cpu_temp_every)  # wait to run again
-        except:
-            logging.info("Sleep timer: 10 (default)")
-            time.sleep(10)
+            data = json.loads(result.stdout)
+            _smartctl_json = True
+        except ValueError:
+            data = None
+            if _smartctl_json is None:  # first try failed to produce JSON: smartctl older than 7.0
+                _smartctl_json = False
+        if data is not None:
+            temp = disk_temp_from_json(data)
+            if temp is not None:
+                return temp, "ok"
+            messages = [m.get("string", "") for m in data.get("smartctl", {}).get("messages", [])]
+            return None, "; ".join(m for m in messages if m) or "no temperature reported"
+
+    result = run(["smartctl", "-n", "standby", "-A", path])
+    text = result.stdout + result.stderr
+    if "standby" in text.lower() and result.returncode & 2:
+        return None, "standby"
+    temp = disk_temp_from_text(result.stdout)
+    if temp is not None:
+        return temp, "ok"
+    return None, (text.strip().splitlines() or ["no temperature reported"])[-1][:200]
+
+
+def disk_temp_from_json(data):
+    current = data.get("temperature", {}).get("current")
+    if isinstance(current, (int, float)):
+        return float(current)
+    nvme = data.get("nvme_smart_health_information_log", {}).get("temperature")
+    if isinstance(nvme, (int, float)):
+        return float(nvme)
+    for attr in data.get("ata_smart_attributes", {}).get("table", []):
+        if attr.get("id") in (194, 190):
+            raw = attr.get("raw", {})
+            match = re.match(r"\s*(\d+)", str(raw.get("string", raw.get("value", ""))))
+            if match:
+                return float(match.group(1))
+    return None
+
+
+def disk_temp_from_text(text):
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 10 and fields[0] in ("194", "190"):
+            match = re.match(r"(\d+)", fields[9])
+            if match:
+                return float(match.group(1))
+    match = (re.search(r"Current Drive Temperature:\s+(\d+)\s*C", text)   # SAS
+             or re.search(r"^Temperature:\s+(\d+)\s*Celsius", text, re.M))  # NVMe
+    return float(match.group(1)) if match else None
+
+
+def read_disks(disks):
+    temps, standby, errors = {}, [], {}
+    for dev in disks:
+        temp, state = read_disk_temp(dev)
+        if temp is not None:
+            temps[dev] = temp
+        elif state == "standby":
+            standby.append(dev)
+        else:
+            errors[dev] = state
+    return temps, standby, errors
+
+
+##
+## Fan curve math
+##
+
+def curve_speed(curve, temp):
+    """Linear interpolation along the curve; holds the end values outside its range."""
+    if temp <= curve[0][0]:
+        return curve[0][1]
+    for (t0, s0), (t1, s1) in zip(curve, curve[1:]):
+        if temp <= t1:
+            if t1 == t0:
+                return s1
+            return s0 + (temp - t0) * (s1 - s0) / (t1 - t0)
+    return curve[-1][1]
+
+
+def clamp_speed(speed, cfg):
+    return int(round(min(max(speed, cfg["min_speed"]), cfg["max_speed"])))
+
+
+class Smoother:
+    """Raise fan speed immediately; lower it only after the target has stayed lower for
+    ramp_down_delay seconds, and then by at most ramp_down_step percent per adjustment.
+    Stops the fan hunting up and down on short temperature spikes."""
+
+    def __init__(self):
+        self.current = None
+        self.lower_since = None
+
+    def reset(self):
+        self.current = None
+        self.lower_since = None
+
+    def update(self, target, now, cfg):
+        if self.current is None or target >= self.current:
+            self.current = target
+            self.lower_since = None
+        else:
+            if self.lower_since is None:
+                self.lower_since = now
+            if now - self.lower_since >= cfg["ramp_down_delay"]:
+                self.current = max(target, self.current - cfg["ramp_down_step"])
+        return self.current
+
+
+class RollingAverage:
+    def __init__(self):
+        self.samples = deque()
+
+    def reset(self):
+        self.samples.clear()
+
+    def add(self, now, value, window):
+        self.samples.append((now, value))
+        while self.samples and now - self.samples[0][0] > window:
+            self.samples.popleft()
+        if not self.samples:  # window of 0 means no averaging
+            return value
+        return sum(v for _, v in self.samples) / len(self.samples)
+
+
+##
+## IPMI
+##
+
+class Fans:
+    def __init__(self, platform):
+        self.platform = platform
+
+    def ipmi(self, *args):
+        run_checked(["ipmitool", "raw"] + list(args))
+
+    def take_control(self):
+        if self.platform == "SM_X10":
+            # "Full" mode: the BMC stops adjusting fans itself and holds whatever duty we set
+            self.ipmi("0x30", "0x45", "0x01", "0x01")
+        elif self.platform == "iDRAC_Gen08":
+            # disable iDRAC automatic fan control
+            self.ipmi("0x30", "0x30", "0x01", "0x00")
+        time.sleep(2)
+
+    def set_zone(self, zone, speed):
+        if self.platform != "SM_X10":
+            raise RuntimeError("per-zone control is only supported on SM_X10")
+        self.ipmi("0x30", "0x70", "0x66", "0x01", "0x{:02x}".format(zone), "0x{:02x}".format(speed))
+
+    def set_all(self, speed):
+        if self.platform == "SM_X10":
+            self.set_zone(0, speed)
+            self.set_zone(1, speed)
+        elif self.platform == "iDRAC_Gen08":
+            self.ipmi("0x30", "0x30", "0x02", "0xff", "0x{:02x}".format(speed))
+
+    def failsafe(self):
+        """Put cooling back in the BMC's hands at a safe level after an error."""
+        if self.platform == "SM_X10":
+            self.ipmi("0x30", "0x45", "0x01", "0x01")  # Full mode resets every zone to 100%
+        elif self.platform == "iDRAC_Gen08":
+            self.ipmi("0x30", "0x30", "0x01", "0x01")  # re-enable iDRAC automatic control
+
+    def release(self):
+        """Return fan control to the BMC when the script stops."""
+        if self.platform == "SM_X10":
+            self.ipmi("0x30", "0x45", "0x01", "0x00")  # Standard mode: BMC's own curve
+        elif self.platform == "iDRAC_Gen08":
+            self.ipmi("0x30", "0x30", "0x01", "0x01")
+
+
+##
+## Main loop
+##
+
+class ErrorLimiter:
+    def __init__(self):
+        self.last = {}
+
+    def should_log(self, key, now):
+        if now - self.last.get(key, -1e9) >= ERROR_REPEAT_SECONDS:
+            self.last[key] = now
+            return True
+        return False
+
+
+def setup_logging():
+    """Log settings are read once at startup (changing them needs a restart)."""
+    parser = ConfigParser()
+    try:
+        parser.read(CONFIG_PATH)
+        section = parser["log_config"]
+        logging.basicConfig(format=section["format"], datefmt=section["date_format"],
+                            filename=section["file_name"], level=logging.INFO)
+    except Exception:
+        logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
+        log.warning("Could not read log settings from %s; logging to stderr", CONFIG_PATH)
+
+
+def handle_signal(signum, _frame):
+    raise SystemExit("received signal {}".format(signum))
+
+
+class Controller:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.fans = Fans(cfg["platform"])
+        self.mtime = config_mtime()
+        self.cpu_avg = RollingAverage()
+        self.smoothers = {}
+        self.sent = {}           # target key -> (speed, time sent)
+        self.hdd_target = None
+        self.hdd_summary = ""
+        self.next_hdd = 0.0
+        self.have_control = False
+        self.in_failsafe = False
+        self.errors = ErrorLimiter()
+        self.last_disk_problems = None
+
+    def reset_state(self):
+        self.cpu_avg.reset()
+        self.smoothers = {}
+        self.sent = {}
+        self.hdd_target = None
+        self.next_hdd = 0.0
+
+    def reload_config_if_changed(self, now):
+        try:
+            mtime = config_mtime()
+        except OSError as exc:
+            if self.errors.should_log("config-stat", now):
+                log.error("Config: cannot read %s (%s); keeping current settings", CONFIG_PATH, exc)
+            return
+        if mtime == self.mtime:
+            return
+        self.mtime = mtime
+        try:
+            cfg = load_config()
+        except ConfigError as exc:
+            log.error("Config: %s -- keeping previous settings until the file is fixed", exc)
+            return
+        if cfg["platform"] != self.cfg["platform"]:
+            self.fans = Fans(cfg["platform"])
+            self.have_control = False
+        self.cfg = cfg
+        self.reset_state()
+        log.info(describe_config(cfg))
+
+    def send(self, key, speed, now):
+        last = self.sent.get(key)
+        if last and last[0] == speed and now - last[1] < REFRESH_SECONDS:
+            return False
+        if key == "all":
+            self.fans.set_all(speed)
+        else:
+            self.fans.set_zone(key, speed)
+        changed = last is None or last[0] != speed
+        self.sent[key] = (speed, now)
+        return changed
+
+    def smooth(self, key, target, now):
+        return self.smoothers.setdefault(key, Smoother()).update(target, now, self.cfg)
+
+    def check_disks(self, now):
+        cfg = self.cfg
+        temps, standby, errors = read_disks(cfg["disks"])
+        problems = (tuple(sorted(errors.items())), tuple(standby))
+        if errors and (problems != self.last_disk_problems or self.errors.should_log("disks", now)):
+            for dev, message in sorted(errors.items()):
+                log.warning("HDD: no temperature from %s (%s); skipping it", dev, message)
+        if standby and problems != self.last_disk_problems:
+            log.info("HDD: in standby, not woken: %s", ", ".join(standby))
+        self.last_disk_problems = problems
+
+        panic = False
+        if temps:
+            avg = sum(temps.values()) / len(temps)
+            hottest = max(temps, key=temps.get)
+            if temps[hottest] >= cfg["hdd_max_temp"]:
+                panic = True
+                target = curve_speed(cfg["hdd_curve"], temps[hottest]) + cfg["panic_addition"]
+            else:
+                target = curve_speed(cfg["hdd_curve"], avg)
+            self.hdd_summary = "HDD Temp: Average = {:.1f}C, Max = {:g}C ({})".format(avg, temps[hottest], hottest)
+            self.hdd_target = clamp_speed(target, cfg)
+            if panic:
+                log.warning("HDD Temp: %s is at %gC (limit %gC) -> HDD fans at least %d%%",
+                            hottest, temps[hottest], cfg["hdd_max_temp"], self.hdd_target)
+        elif errors:
+            # could not read anything: hold the last known speed, or go to max if we never had one
+            if self.hdd_target is None:
+                self.hdd_target = cfg["max_speed"]
+            self.hdd_summary = "HDD Temp: no readings"
+        else:
+            # every drive is spun down, so they are cool
+            self.hdd_target = clamp_speed(min(s for _, s in cfg["hdd_curve"]), cfg)
+            self.hdd_summary = "HDD Temp: all drives in standby"
+        return panic
+
+    def tick(self, now):
+        cfg = self.cfg
+        # read temperatures before touching the fans, so a failing sensor never leaves
+        # the BMC in manual mode without a speed (it stays in failsafe instead)
+        cpu_temp = get_cpu_temp(cfg["os"])
+        cpu_avg = self.cpu_avg.add(now, cpu_temp, cfg["cpu_average_seconds"])
+        cpu_target = clamp_speed(curve_speed(cfg["cpu_curve"], cpu_avg), cfg)
+
+        hdd_checked = False
+        if cfg["focus"] == "Both" and now >= self.next_hdd:
+            self.check_disks(now)
+            self.next_hdd = now + cfg["hdd_timer"]
+            hdd_checked = True
+        use_hdd = cfg["focus"] == "Both" and self.hdd_target is not None
+
+        if not self.have_control:
+            self.fans.take_control()
+            self.have_control = True
+            now = time.monotonic()
+
+        cpu_line = "CPU Temp: {:.1f}C (avg {:.1f}C)".format(cpu_temp, cpu_avg)
+        every = cfg["log_frequency"] == "Every"
+        on_change = cfg["log_frequency"] == "On_Change"
+
+        if cfg["linked"]:
+            target = max(cpu_target, self.hdd_target) if use_hdd else cpu_target
+            speed = self.smooth("all", target, now)
+            changed = self.send("all", speed, now)
+            source = "HDD" if use_hdd and self.hdd_target > cpu_target else "CPU"
+            if every or (on_change and changed):
+                parts = [cpu_line] + ([self.hdd_summary] if use_hdd else [])
+                log.info("%s -> Fans: %d%% (driven by %s)", ", ".join(parts), speed, source)
+        else:
+            speed = self.smooth(cfg["cpu_zone"], cpu_target, now)
+            changed = self.send(cfg["cpu_zone"], speed, now)
+            if every or (on_change and changed):
+                log.info("%s -> Zone %d fans: %d%%", cpu_line, cfg["cpu_zone"], speed)
+            if use_hdd:
+                hdd_speed = self.smooth(cfg["hdd_zone"], self.hdd_target, now)
+                changed = self.send(cfg["hdd_zone"], hdd_speed, now)
+                if (every and hdd_checked) or (on_change and changed):
+                    log.info("%s -> Zone %d fans: %d%%", self.hdd_summary, cfg["hdd_zone"], hdd_speed)
+
+    def go_failsafe(self, now, exc):
+        key = "error:{}".format(exc)
+        if self.errors.should_log(key, now):
+            log.error("Error during control loop: %s", exc, exc_info=True)
+        if not self.in_failsafe:
+            log.warning("Failsafe: handing fans back to the BMC at full/automatic speed until readings recover")
+            try:
+                self.fans.failsafe()
+            except Exception as fs_exc:
+                log.error("Failsafe command failed too: %s", fs_exc)
+            self.in_failsafe = True
+            self.have_control = False
+            self.reset_state()
+
+    def run(self):
+        next_tick = time.monotonic()
+        while True:
+            now = time.monotonic()
+            try:
+                self.reload_config_if_changed(now)
+                self.tick(now)
+                if self.in_failsafe:
+                    log.info("Recovered from error; resuming fan control")
+                    self.in_failsafe = False
+            except Exception as exc:
+                self.go_failsafe(now, exc)
+            # schedule against the clock so slow smartctl runs don't stretch the interval
+            next_tick += self.cfg["cpu_timer"]
+            delay = next_tick - time.monotonic()
+            if delay < 0:
+                next_tick = time.monotonic()
+                delay = 0
+            time.sleep(delay)
+
+
+def main():
+    setup_logging()
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        log.error("Config: %s -- not starting", exc)
+        print("fan-control: {}".format(exc), file=sys.stderr)
+        return 1
+
+    log.info("==== Fan control starting (assuming direct control) ====")
+    log.info(describe_config(cfg))
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    controller = Controller(cfg)
+    try:
+        controller.run()
+    except SystemExit as exc:
+        log.info("Stopping: %s", exc)
+    finally:
+        try:
+            controller.fans.release()
+            log.info("Fan control handed back to the BMC")
+        except Exception as exc:
+            log.error("Could not hand fan control back to the BMC: %s", exc)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

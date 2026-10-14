@@ -7,6 +7,19 @@ It includes a means of running as a service, including reading the configuration
 
 This repo is officially entering archive status. Due to changes in my homelab environment, and limited available time to work on it versus other projects, it's time to mark as read-only.
 
+## Changes in this fork
+
+- **Configurable fan zones** (`cpu_zone` / `hdd_zone`) for boards where the CPU fan is on the lettered (FANA) header. See jp-powers/fan-control#17.
+- **Smoothing**: CPU temperature is averaged over a few seconds and fans ramp down gradually after a delay, so short load spikes no longer spin the CPU fan up and down.
+- **Fan limits** (`min_speed` / `max_speed`) applied after the curves.
+- **Drive reads no longer crash the script**: missing or unreadable drives are logged and skipped, sleeping drives are not woken (`smartctl -n standby`), and SAS/NVMe drives are supported.
+- **HDD panic** now uses the hottest drive's temperature on the curve, names that drive in the log, and no longer pauses CPU monitoring.
+- **Safer failure handling**: on an error, control goes back to the BMC (Supermicro Full mode / iDRAC automatic) once, without flooding the log. When the script stops it hands fan control back to the BMC.
+- **Boot fix**: `config.ini` is found next to the script, so it works when started from rc.d or a TrueNAS Init task.
+- No more `Sleep timer` log line every second.
+
+New settings have defaults, so an existing `config.ini` keeps working. Add `[fan_limits]` and `[smoothing]` sections to tune them (see CONFIGURATION_SUGGESTIONS.md).
+
 # Some explanation is required
 
 There are a number of specific tools like this for each of the platforms, but I've been unsatisfied with most and the one I do like was in Ruby, which isn't quite as cross-platform as I'd like. I recreated the script in Python, added a means of checking HDD temps, and then made necessary changes depending on platform for checking things like CPU temps and whatnot.
